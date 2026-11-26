@@ -2493,14 +2493,18 @@ fn host_texture_as(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // A texture a shader reads in an sRGB family is typeless on the host too,
-    // so its views may name the sRGB or the linear format. A typed host copy
-    // forced every view to the texture's own format: an sRGB view of a linear
-    // copy was read as linear (pastel colors in the fishing mission), and a
-    // linear view of an sRGB copy as sRGB.
+    // A shader-read texture whose title format is linear (or typeless) in an
+    // sRGB family is typeless on the host, so an sRGB view of it decodes
+    // (the pastel albedo). An sRGB title texture stays typed: a linear view
+    // is still read with its sRGB conversion, which the lighting/lightmaps
+    // expect. Making every sRGB-family copy typeless made the lighting
+    // vanish.
     if d.flags & DENY_SHADER_RESOURCE == 0
         && d.flags & (TARGET | UNORDERED | DEPTH) == 0
-        && SRGB.iter().any(|&(srgb, linear)| srgb == d.format || linear == d.format)
+        && let Some(&(_, linear)) = SRGB
+            .iter()
+            .find(|&&(srgb, linear)| srgb == d.format || linear == d.format)
+        && (d.format == linear || d.format == family(linear))
     {
         d.format = family(d.format);
     }
