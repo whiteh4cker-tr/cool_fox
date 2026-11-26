@@ -60,6 +60,7 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    println!("settings       {}", settings_line(console));
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -196,6 +197,52 @@ pub fn run(
     println!("title exited with {code}");
     Ok(())
 }
+
+/// Every `VICTORY_*` the launcher (`Play-VIctory.cmd`) sets, as this process
+/// resolved them (`<unset>` when nothing set them). The launcher gives each
+/// one its value only when the caller left it alone, so two runs of the same
+/// build ask for different things whenever a shell, a second launcher or an
+/// earlier experiment carries one of them — and a run that looks different
+/// from the one before is otherwise undiagnosable. Printed on every run,
+/// beside the build line, because `VICTORY_LOG` is `warn` by default.
+fn settings_line(console: Console) -> String {
+    let mut line = format!("--console {}", match console {
+        Console::SeriesX => "series-x",
+        Console::SeriesS => "series-s",
+    });
+    for name in SWITCHES {
+        line.push_str(&format!(" {name}={}", std::env::var(name).unwrap_or_else(|_| "<unset>".to_owned())));
+    }
+    line
+}
+
+/// The switches `Play-VIctory.cmd` hands down, kept complete by a test that
+/// reads the launcher beside it.
+const SWITCHES: &[&str] = &[
+    "VICTORY_AMBIENT",
+    "VICTORY_AMBIENT_AIR",
+    "VICTORY_CACHE_DIR",
+    "VICTORY_CARD_AWAKE",
+    "VICTORY_CARD_BUFFERS_MIN_KB",
+    "VICTORY_CARD_REHASH_RUNS",
+    "VICTORY_CARD_STEPS",
+    "VICTORY_GAME_DIR",
+    "VICTORY_INDIRECT_BATCH",
+    "VICTORY_INDIRECT_WINDOW",
+    "VICTORY_JOIN_COPIES",
+    "VICTORY_JOIN_PARTS",
+    "VICTORY_LEVELS_ON_DEMAND",
+    "VICTORY_LOG",
+    "VICTORY_MAP_THREADS",
+    "VICTORY_RELAY",
+    "VICTORY_RELAY_COPY",
+    "VICTORY_SHOW_AFTER",
+    "VICTORY_TEXTURE_GUARD",
+    "VICTORY_TEXTURE_NO_WAIT",
+    "VICTORY_THIN",
+    "VICTORY_UPLOAD_AHEAD",
+    "VICTORY_WIDE_BACK",
+];
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
@@ -469,6 +516,31 @@ mod absent_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    /// Every switch the launcher passes down is named in the line a run
+    /// prints: a run that looks unlike the one before is read from that line,
+    /// and it is only worth reading while it stays complete.
+    #[test]
+    fn the_settings_line_names_every_launcher_switch() {
+        let launcher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|apps| apps.parent())
+            .map(|root| root.join("Play-VIctory.cmd"))
+            .expect("the repo root holds the launcher");
+        let text = std::fs::read_to_string(&launcher).unwrap_or_else(|e| panic!("{}: {e}", launcher.display()));
+        let mut named = 0;
+        let line = super::settings_line(super::Console::SeriesX);
+        for word in text.split_whitespace().filter(|w| w.starts_with("VICTORY_")) {
+            let name = word.trim_end_matches(|c: char| !c.is_ascii_uppercase() && c != '_');
+            assert!(
+                super::SWITCHES.contains(&name),
+                "{name} is set by the launcher but missing from SWITCHES"
+            );
+            assert!(line.contains(name), "{name} is not in the printed line: {line}");
+            named += 1;
+        }
+        assert!(named >= 15, "the launcher's switches were not read: {named}");
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
