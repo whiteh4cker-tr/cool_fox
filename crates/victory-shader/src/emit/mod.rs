@@ -122,7 +122,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_ADDRESSES, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -392,10 +392,19 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+///
+/// A program refused at a lane mask with lanes elsewhere read as data is
+/// translated once more with mask operations on numbers read as the
+/// numbers they compute (`lower::with_mask_ops_on_numbers`), and only such
+/// a program: with that on for every program, 69 compute programs that
+/// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| translate_plain(container))
         }
         other => other,
     }
@@ -427,6 +436,28 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// [`emit`] with the same second tries as [`translate`] (first halves of
+/// interpolations as pairs, mask operations on numbers), for tools that
+/// run the stages themselves.
+pub fn emit_with_retries(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| emit(c, native, p, st, io, res))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| emit(c, native, p, st, io, res))
+        }
+        other => other,
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
