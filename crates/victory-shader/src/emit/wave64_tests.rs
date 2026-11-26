@@ -736,3 +736,129 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// A per-lane loop header `L` whose back-edge returns to `L` before reaching a
+/// strict post-dominator is only visited by the active subset of lanes on
+/// subsequent iterations: `all_lanes(L)` must be `false` so a cross-wave
+/// reduction inside `L` cannot emit a barrier where exited host waves never
+/// return. Widening `L` runs all 64 lanes together across every iteration.
+#[test]
+fn divergent_loop_header_exchanges_only_when_widened() {
+    // s0: upper-half iteration count (1 for lanes 0..31, s0 for lanes 32..63).
+    // Block L starts at `v_lshlrev_b32 v7, v8, v11` and branches back to L via
+    // `s_cbranch_execnz`. Wave 0 exits after iter 0 while wave 1 runs s0 iters.
+    let mut words = vec![
+        0xBE8C_047Eu32, // s_mov_b64 s[12:13], exec
+        0x7E10_0280,    // v_mov_b32 v8, 0   (iter)
+        0x7E12_0280,    // v_mov_b32 v9, 0   (acc)
+        0x7E14_0281,    // v_mov_b32 v10, 1
+        0x7D88_00A0,    // v_cmp_gt_u32 vcc, 32, v0
+        0x0214_1400,    // v_cndmask_b32 v10, s0, v10 (limit = t < 32 ? 1 : s0)
+        0x2C16_0085,    // v_lshrrev_b32 v11, 5, v0
+        0x4A16_1681,    // v_add_nc_u32 v11, 1, v11   (1 for wave 0, 2 for wave 1)
+        // Loop header & back-edge L:
+        0x340E_1708, // v_lshlrev_b32 v7, v8, v11
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x4A12_1207,             // v_add_nc_u32 v9, s7, v9
+        0x4A10_1081,             // v_add_nc_u32 v8, 1, v8
+        0x7D88_110A,             // v_cmp_gt_u32 vcc, v10, v8
+        0x87FE_6A7E,             // s_and_b64 exec, exec, vcc
+        0xBF89_FFE6,             // s_cbranch_execnz L (-26 dwords)
+        0xBEFE_040C,             // s_mov_b64 exec, s[12:13]
+        0x7D84_00A0,             // v_cmp_eq_u32 vcc, 32, v0
+        0xBE8C_246A,             // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002,             // s_cbranch_execz +2
+        0x38 << 26 | 0x1C << 18, // buffer_store_dword v9, off, s[8:11], 0
+        0x80 << 24 | 2 << 16 | 9 << 8,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let loop_header = st
+        .wave_any
+        .iter()
+        .position(|w| *w == Some(true))
+        .expect("divergent loop header branch");
+
+    let err = lowered(&native, &p, &HashSet::new())
+        .expect_err("unwidened divergent loop header must be refused");
+    assert!(err.to_string().contains("not every lane"), "{err}");
+    assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![loop_header]));
+
+    let shader = lowered(&native, &p, &HashSet::from([loop_header])).expect("widened loop");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // s0 = 1 -> both waves run iter 0: 1 | 2 = 3.
+    // s0 = 3 -> iter 0 gives (1 | 2) = 3, iter 1 gives 4, iter 2 gives 8 -> sum 15.
+    for (iters, expected) in [(1u32, 3u32), (3, 15)] {
+        let Some(got) = on_the_card(&shader, [iters, 0]) else { return };
+        assert_eq!(got, expected, "iters = {iters}");
+    }
+}
+
+/// Without `VICTORY_WAVE_WIDE`, `emit` still falls back to widening `[64, 1, 1]`
+/// console programs whose LDS traffic sits inside a divergent branch when
+/// barrier-free forms (including `local_waves`) cannot avoid a cross-wave wait.
+#[test]
+fn fallback_widen_recovers_lds_region_in_single_console_wave() {
+    let words = [
+        0x7E0A_0280u32,                // v_mov_b32 v5, 0 (LDS[0] addr)
+        0x7E08_0280,                   // v_mov_b32 v4, 0
+        0xD834_0000,                   // ds_write_b32 v5, v4
+        0x0000_0405,
+        0xBF8C_0070,                   // s_waitcnt vmcnt(0) & lgkmcnt(0)
+        0x7D88_0000,                   // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A,                   // s_and_saveexec_b64 s[12:13], vcc
+        0xBF86_0007,                   // s_cbranch_vccz after (+7 dwords)
+        0x3406_0082,                   // v_lshlrev_b32 v3, 2, v0
+        0x4A04_0001,                   // v_add_nc_u32 v2, s1, v0
+        0xD834_0000,                   // ds_write_b32 v3, v2
+        0x0000_0203,
+        0xBF8C_0070,                   // s_waitcnt vmcnt(0) & lgkmcnt(0)
+        0xD8D8_0000,                   // ds_read_b32 v4, v5
+        0x0400_0005,
+        0xBEFE_040C,                   // after: s_mov_b64 exec, s[12:13]
+        0xBF8C_0070,                   // s_waitcnt vmcnt(0) & lgkmcnt(0)
+        0x7D84_00A0,                   // v_cmp_eq_u32 vcc, 32, v0
+        0xBE8C_246A,                   // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002,                   // s_cbranch_execz +2
+        0x38 << 26 | 0x1C << 18,       // buffer_store_dword v4, off, s[8:11], 0
+        0x80 << 24 | 2 << 16 | 4 << 8,
+        0xBEFE_040C,                   // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native(&words);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: (5 << 1) | (1 << 15), // 5 user SGPRs + 512 bytes LDS
+        threads: [64, 1, 1],
+    });
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).unwrap();
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let unwidened = super::emit_program(&c, &native, &p, &st, &io, &res).expect("unwidened emit_program");
+    let local = lower::with_local_waves(|| super::emit_program(&c, &native, &p, &st, &io, &res))
+        .expect("local_waves emit_program");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+
+    assert_eq!(unwidened.1, Some(64), "divergent LDS write/read must fail wave32 unwidened");
+    assert_eq!(local.1, Some(64), "single-wave LDS sharing must still fail wave32 in local_waves");
+    let shader = shader.expect("fallback widen must emit wave32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (lanes, written, expected) in [(0u32, 42u32, 0u32), (33, 42, 42)] {
+        let Some(got) = on_the_card(&shader, [lanes, written]) else { return };
+        assert_eq!(got, expected, "lanes = {lanes}, written = {written}");
+    }
+}

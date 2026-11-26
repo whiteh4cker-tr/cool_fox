@@ -638,6 +638,24 @@ pub fn emit(
                 }
             }
         }
+        // Last exact resort for single-console-wave ([64, 1, 1]) programs that
+        // share LDS across a lane-branch region or need wave-wide control flow:
+        // runs only after every barrier-free form (`local_waves` included) failed,
+        // so programs like `ptfx_CS_lightAtlas_*` keep their low-barrier path.
+        if !wide_on && !driver_loop && wide_option.as_ref().is_none_or(|v| v != "0") {
+            let bases = [
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (fallback)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

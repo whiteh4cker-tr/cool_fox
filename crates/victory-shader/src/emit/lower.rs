@@ -491,11 +491,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
-        // blocks reachable from the lane branch that do not post-dominate it
+        // blocks reachable from the lane branch that do not strictly post-dominate it
+        // (including `d` itself when a cycle returns to it, since only remaining lanes repeat)
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            if seen[b] || (b != d && (pdom[d][b / 64] >> (b % 64)) & 1 == 1) {
                 continue;
             }
             seen[b] = true;
