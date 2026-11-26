@@ -3253,6 +3253,7 @@ impl HostHeap {
             && quick_mirror()
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
+            && !matches!(view, View::Constant(address, _) if address & 0xff != 0)
         {
             return Some(view);
         }
@@ -4190,26 +4191,45 @@ fn make_twinned(
     match view {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            let bytes = constant_bytes(size).max(256);
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
+            // The console needs 16-byte alignment; the host wants 256 and
+            // refuses a view anywhere else (a constant buffer at 0x...b0 is
+            // the sun's, and its zeroed constants drew a black disk). Copy
+            // it to an aligned upload buffer instead. The slot is remade on
+            // every use (`mirror` does not take the quick path for a
+            // constant buffer), so the copy is as fresh as the draw.
+            let aligned = if gpu % 256 == 0 {
+                None
+            } else {
+                let (buffer, data) = host.upload_buffer(u64::from(bytes))?;
+                let copy = (shadow.left(address).min(u64::from(bytes))) as usize;
+                // SAFETY: `data` is the mapped, writable upload buffer.
+                unsafe {
+                    crate::host::read_there(address as *const u8, std::slice::from_raw_parts_mut(data, copy));
+                    std::ptr::write_bytes(data.add(copy), 0, bytes as usize - copy);
+                }
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                Some((buffer, gpu))
+            };
+            let (gpu, kept) = match aligned {
+                Some((buffer, gpu)) => (gpu, Some(buffer)),
+                None => (gpu, Some(shadow.buffer.clone())),
+            };
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_bytes(size),
+                SizeInBytes: bytes,
             };
-            // SAFETY: slots of our heap; the range lies in the host copy.
+            // SAFETY: slots of our heap; the range lies in the host copy or
+            // the aligned upload buffer held by the slot.
             unsafe {
                 device.CreateConstantBufferView(Some(&desc), at);
                 if let Some(twin) = twin {
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            Some(kept)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;

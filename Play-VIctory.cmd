@@ -43,6 +43,12 @@ if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
+rem A cold pipeline cache can drop a one-off draw whose pipeline takes longer
+rem than the 500 ms budget: the diner cutscene's head skin is the one people
+rem notice (the eyes and teeth still draw). Give each thread time for the
+rem pipeline it asked for; once the cache is warm nothing waits.
+if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=10000"
+if not defined VICTORY_PIPELINE_WAIT_SHARED set "VICTORY_PIPELINE_WAIT_SHARED=0"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 rem Series X, not S: on an 8 GB card series-s drops the head/skin meshes (faces
