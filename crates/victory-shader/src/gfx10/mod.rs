@@ -217,7 +217,12 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // v_nop, v_pipeflush and v_clrexcp ignore SRC0.
+                let len = if matches!(opcode, 0x00 | 0x1b | 0x41) { 1 } else { 1 + extra };
+                (Encoding::Vop1, opcode, len)
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -361,6 +366,28 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    #[test]
+    fn operandless_vop1_preserves_the_following_instruction() {
+        for (opcode, name) in [(0, "v_nop"), (0x1b, "v_pipeflush"), (0x41, "v_clrexcp")] {
+            for src in [0xe9, 0xea, 0xf9, 0xfa, 0xff] {
+                let word = 0x7e00_0000 | (opcode << 9) | src;
+                assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")]);
+            }
+        }
+        assert_eq!(summary(&[0x7e00_02ff, 123, S_ENDPGM]), [(0, 2, "v_mov_b32"), (8, 1, "s_endpgm")]);
+    }
+
+    #[test]
+    fn vop3_cmpx_writes_the_active_exec_lanes() {
+        let code = bytes(&[0xd411_0005, 0x0001_e501, S_ENDPGM]);
+        let decoded = decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("v_cmpx_lt_f32"));
+        for (wave64, dwords) in [(false, 1), (true, 2)] {
+            let Fields::Valu(v) = decoded[0].fields(wave64) else { panic!("expected a vector instruction") };
+            assert_eq!(v.dst, Some(Operand::Scalar { code: 126, dwords }));
+        }
     }
 
     #[test]
