@@ -4270,7 +4270,10 @@ fn make_twinned(
                     let depth = crate::resource::DEPTH_FORMATS
                         .iter()
                         .any(|&(typed, _)| crate::resource::family(v) == crate::resource::family(typed));
-                    if !depth && crate::resource::family(v) == v {
+                    if !depth
+                        && crate::resource::family(v) == v
+                        && crate::resource::family(v + 1) == v
+                    {
                         d.Format.0 = crate::resource::view_format(resource).unwrap_or(v + 1) as i32;
                     }
                 }
