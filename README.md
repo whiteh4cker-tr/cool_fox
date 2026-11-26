@@ -1,17 +1,20 @@
-# VIctory on an RX 7900 XTX
+# cool_fox · VIctory for Windows
 
-## Run the codec_d Windows build
+## Build and run on Windows
 
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
+Install the Rust toolchain pinned in `rust-toolchain.toml` and the MSVC C++ build tools with a Windows SDK. From PowerShell in the checkout, build the Windows runner and point the launcher at your own complete Xbox dump.
 
 ```powershell
+cargo build --release --locked -p victory
 $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
 .\Play-VIctory.cmd pareto-residency
 ```
 
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+The launcher finds `target\release\victory.exe` in a source build. If you already have the Windows x64 ZIP, extract it and run the last two commands in the extracted folder.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+`Play-VIctory.cmd` selects Series S and the RTX-tested residency settings. The shader cache defaults to `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to choose a different cache directory. The runner requires Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support. The [GPU residency journal](docs/bug-journal.md) records tests on an RTX 5090.
+
+## Upstream AMD fork
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
@@ -22,7 +25,7 @@ one PC, without giving up the picture. It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Upstream RX 7900 XTX results (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, 1440p, the Series X profile.
@@ -49,7 +52,7 @@ What is known to be wrong:
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
-## How to run it
+## Run the upstream AMD profile
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
