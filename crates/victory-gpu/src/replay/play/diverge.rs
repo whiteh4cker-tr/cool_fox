@@ -1214,7 +1214,7 @@ impl Player {
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
-                word(8),
+                word(8), // Flags: dword 8 in both SRV and UAV buffer descs.
             ),
         }
     }

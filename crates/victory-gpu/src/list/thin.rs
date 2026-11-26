@@ -938,6 +938,7 @@ mod tests {
     /// A view's record is the one at the call, also if its slot is written
     /// again right after.
     #[test]
+    #[allow(unused_assignments)] // the write after the call is the point
     fn a_target_is_the_one_at_the_call() {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);

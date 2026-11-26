@@ -1,5 +1,9 @@
 # GPU residency bug journal
 
+Kept as written. Paths such as `Downloads/leonida/`, `tools/cache-pareto` and
+`../XCL-frame-timing/` are on the author's machine, and the binaries named by
+SHA-256 were never committed (executables are excluded by policy).
+
 ## 2026-11-25, Pacific time
 
 - **15:38, source verification.** The default `Play-VIctory.cmd` and its `fast` selector use the same local release. Its SHA-256 matches the build from `pareto-rtx-fast` at `fabb872`. The live window showed 81.4 ms/frame for an interval with 4,463 draws/frame. This observation has no controlled scene match.

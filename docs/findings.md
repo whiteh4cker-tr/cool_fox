@@ -90,8 +90,10 @@ in that order of size:
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
-   budget, so that every later draw of it is empty. The log's frame line counts them;
-   `VICTORY_INDIRECT_REST=0` is the experiment.
+   budget, so that every later draw of it is empty. The log's frame line counts them.
+   Since f4b48ad such a record takes nothing by default; `VICTORY_INDIRECT_REST=1`
+   brings the old behaviour back for comparison. Whether that ends the flicker is
+   not measured here yet.
 5. Memory, 40-46 GB private: lists' allocators 9 GB, windows 7, uploads 4
    (`VICTORY_MEMORY_MAP=1` lists it).
 

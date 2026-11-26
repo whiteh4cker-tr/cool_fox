@@ -2974,6 +2974,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
+// Read by `copystat`, which is part of the diagnostics build.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
