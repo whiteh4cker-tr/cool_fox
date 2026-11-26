@@ -309,6 +309,7 @@ fn rest() -> u32 {
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let batched = source == batch::SOURCE;
+    // Used by the root signature below, so no longer diagnostics-only.
     let root = root_signature(device, batched)?;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
@@ -2784,7 +2785,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                     12,
                 );
             }
-            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            // Two big records leave 2,048 budget (< small's 4,096); the third
+            // refuses in both REST=0 and REST=1, so small runs empty in rounds
+            // 0..2 and starts fresh in the next submission.
+            std::ptr::copy_nonoverlapping([64u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
             std::ptr::write_bytes(hits_ptr, 0, 256);
         }
         // SAFETY: a live buffer.
@@ -2827,7 +2831,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         list.reset();
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 1, "the budget starts empty at the next submission");
+        assert_eq!(hits, 64, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
@@ -3220,47 +3224,52 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
-        const BUDGET: u32 = 1 << 27;
-        // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
-            let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
-            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-            let (back, back_ptr, _) = warp.shared_buffer(1024);
-            let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
-            let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
-            // SAFETY: mapped buffers, which the list has not read yet.
-            let mut table = unsafe {
-                std::ptr::write_bytes(budget_ptr, 0, 256);
-                for r in 0..records {
-                    for (w, word) in [1u32 << 22, 16, 5, 6].into_iter().enumerate() {
-                        src_ptr.cast::<u32>().add(r as usize * 4 + w).write_volatile(word);
+        for take_rest in [false, true] {
+            let source = batch::SOURCE.replace("REST ?", if take_rest { "true ?" } else { "false ?" });
+            let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
+            const BUDGET: u32 = 1 << 27;
+            // 2^26 vertices each, as much as a draw is let run: two fill it.
+            for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+                let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+                let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+                let (back, back_ptr, _) = warp.shared_buffer(1024);
+                let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+                let dst = warp.default_uav(64 << 10);
+                batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                // SAFETY: mapped buffers, which the list has not read yet.
+                let mut table = unsafe {
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    for r in 0..records {
+                        for (w, word) in [1u32 << 22, 16, 5, 6].into_iter().enumerate() {
+                            src_ptr.cast::<u32>().add(r as usize * 4 + w).write_volatile(word);
+                        }
+                    }
+                    batch::Table::new(table_ptr, 0, [1, 0, 0, 0])
+                };
+                for _ in 0..times {
+                    for r in 0..records {
+                        assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
                     }
                 }
-                batch::Table::new(table_ptr, 0, [1, 0, 0, 0])
-            };
-            for _ in 0..times {
-                for r in 0..records {
-                    assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
+                // SAFETY: an open list; the records are readable as arguments.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
                 }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let (spent, out): (u32, Vec<u32>) = unsafe {
+                    (
+                        budget_ptr.cast::<u32>().read_volatile(),
+                        (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
+                    )
+                };
+                assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
+                assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
+                let asked = (1 << 26) * times * records as u32;
+                let expected = if filled == 0 && !take_rest { 0 } else { BUDGET.min(asked) };
+                assert_eq!(spent, expected);
             }
-            // SAFETY: an open list; the records are readable as arguments.
-            unsafe {
-                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
-            }
-            warp.submit_and_wait();
-            // SAFETY: the list has run; mapped words.
-            let (spent, out): (u32, Vec<u32>) = unsafe {
-                (
-                    budget_ptr.cast::<u32>().read_volatile(),
-                    (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
-                )
-            };
-            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
-            assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
         }
     }
 
@@ -3496,6 +3505,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
+        #[allow(dead_code)]
         depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
