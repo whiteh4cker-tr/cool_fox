@@ -4260,6 +4260,20 @@ fn make_twinned(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A host texture made typeless (the title's format is, or a
+                // stand-in) needs a typed view: a typeless SRV is invalid and
+                // the sample reads the null slot (the sun's 256x64
+                // R10G10B10A2 texture was one). The title's own format is
+                // first, else the typed neighbour of the typeless one.
+                if let Some(d) = desc.as_mut() {
+                    let v = d.Format.0 as u32;
+                    let depth = crate::resource::DEPTH_FORMATS
+                        .iter()
+                        .any(|&(typed, _)| crate::resource::family(v) == crate::resource::family(typed));
+                    if !depth && crate::resource::family(v) == v {
+                        d.Format.0 = crate::resource::view_format(resource).unwrap_or(v + 1) as i32;
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }

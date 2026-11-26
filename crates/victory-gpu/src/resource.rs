@@ -645,8 +645,17 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear twins: R8G8B8A8, B8G8R8A8 and B8G8R8X8,
+/// then BC1, BC2, BC3 and BC7.
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (91, 87),
+    (93, 88),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (99, 98),
+];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -2482,6 +2491,17 @@ fn host_texture_as(
     // The host has no sRGB unordered access: such textures are typeless,
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+        d.format = family(d.format);
+    }
+    // A texture a shader reads in an sRGB family is typeless on the host too,
+    // so its views may name the sRGB or the linear format. A typed host copy
+    // forced every view to the texture's own format: an sRGB view of a linear
+    // copy was read as linear (pastel colors in the fishing mission), and a
+    // linear view of an sRGB copy as sRGB.
+    if d.flags & DENY_SHADER_RESOURCE == 0
+        && d.flags & (TARGET | UNORDERED | DEPTH) == 0
+        && SRGB.iter().any(|&(srgb, linear)| srgb == d.format || linear == d.format)
+    {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
