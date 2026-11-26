@@ -4352,6 +4352,23 @@ fn make_twinned(
                 }
             }
             let mut desc = desc.as_ref().map(uav_desc);
+            // A typeless unordered-access view needs a typed format too: a
+            // typeless UAV is invalid, so a compute pass that bakes a texture
+            // (the sun's 256x64 R10G10B10A2 color LUT) wrote nothing and the
+            // sampled disk stayed black. The title's own format first, else
+            // the typed neighbour; only true typeless formats.
+            if let Some(d) = desc.as_mut() {
+                let v = d.Format.0 as u32;
+                let depth = crate::resource::DEPTH_FORMATS
+                    .iter()
+                    .any(|&(typed, _)| crate::resource::family(v) == crate::resource::family(typed));
+                if !depth
+                    && crate::resource::family(v) == v
+                    && crate::resource::family(v + 1) == v
+                {
+                    d.Format.0 = crate::resource::view_format(resource).unwrap_or(v + 1) as i32;
+                }
+            }
             // A depth texture's unordered access is its colour twin's: the
             // host gives a depth texture none.
             let twin = crate::resource::twin_resource(resource)
