@@ -141,12 +141,24 @@ impl Front {
         let schedule = {
             let mut inner = held(&recording.inner);
             inner.chunks.push_back(words);
+            inner.handed += 1;
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
+    }
+
+    /// Hands over what is written and waits until it is translated: the calls
+    /// made so far have reached the list of ours when this returns. Used for
+    /// the copies that must take effect now (into a full-screen video frame),
+    /// whose source the title writes again for the next one.
+    fn flush(&mut self) {
+        let Some(recording) = self.recording.clone() else { return };
+        self.hand_over();
+        let upto = held(&recording.inner).handed;
+        recording.flush_to(upto);
     }
 
     fn close(&mut self) {
@@ -198,6 +210,10 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Streams handed over, and streams translated: a call is in effect on
+    /// the list of ours once its stream is translated ([`Recording::flush_to`]).
+    handed: u64,
+    translated: u64,
 }
 
 impl Recording {
@@ -219,6 +235,14 @@ impl Recording {
     pub(crate) fn wait(&self) {
         let mut inner = held(&self.inner);
         while !self.done() {
+            inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits until stream `upto` has been translated.
+    fn flush_to(&self, upto: u64) {
+        let mut inner = held(&self.inner);
+        while inner.translated < upto {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -248,6 +272,8 @@ impl Recording {
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
+            inner.translated += 1;
+            self.moved.notify_all();
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
@@ -658,11 +684,21 @@ extern "system" fn copy_texture_region(
         return;
     }
     let boxed = !source_box.is_null();
+    // A copy into a full-screen single-mip image (a decoded video frame): what
+    // the list reads must be this copy, so the stream is translated to it
+    // before the call returns. Left to the threads, the frame the list reads
+    // was the one before (the opening video stopped and went on).
+    // SAFETY: the title passes the location; plain read.
+    let video = unsafe { (*dst).resource };
+    let video = crate::resource::is_video_frame(video as crate::object::This);
     front(this).put_with(
         COPY_TEXTURE,
         &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
         &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
     );
+    if video {
+        front(this).flush();
+    }
 }
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 extern "system" fn copy_texture_region_x(

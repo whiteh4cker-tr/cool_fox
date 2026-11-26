@@ -307,6 +307,26 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// Whether the title texture `this` is a full-screen single-mip image the title
+/// fills every frame (a decoded video frame or a full-screen overlay): a copy
+/// into it must take effect before the next list is recorded, or the frame the
+/// list reads is the one before (`VICTORY_THIN`, whose calls are translated
+/// later by threads of ours).
+#[cfg(windows)]
+pub(crate) fn is_video_frame(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let d = resource(this).desc;
+    const BUFFER: u32 = 1;
+    const TEXTURE2D: u32 = 3;
+    d.dimension == TEXTURE2D
+        && d.mip_levels == 1
+        && d.width >= 1280
+        && d.height >= 720
+        && d.dimension != BUFFER
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
