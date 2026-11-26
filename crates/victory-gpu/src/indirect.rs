@@ -43,7 +43,6 @@ use crate::host::{HostList, host, transition};
 pub(crate) mod batch;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -57,10 +56,12 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+// Written as words: Wine's compiler stores to structured buffers only.
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
+// records run empty. In words: 0 the budget, 1-4 diagnostics (the old
+// bytes 4, 8, 12, 16).
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -77,7 +78,6 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
@@ -89,7 +89,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    // In words: strides are multiples of 4.
+    uint dst_at = id.x * (stride / 4);
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -161,8 +162,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // No `[allow_uav_condition]`: Wine's compiler stops at it.
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -173,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -195,17 +196,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -215,17 +216,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     }
 }
@@ -304,8 +308,8 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
+    let root = root_signature(device, batched)?;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -339,11 +343,10 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -355,6 +358,71 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         #[cfg(feature = "diagnostics")]
         crate::host::name(&pso, || crate::replay::play::CLAMP.into());
         Ok(Clamp { root, pso })
+    }
+}
+
+/// The clamps' root signatures, made here rather than taken from the shader:
+/// under Wine `D3DCompile` is vkd3d-shader's, which does not embed a
+/// `[RootSignature]`. The clamp: six constants at b0, the source arguments
+/// and the count (t0, t1), the clamped arguments and the budget (u0, u1).
+/// The batched clamp: the four sources and the jobs (t0-t4), then u0, u1.
+/// Flags as a version 1.1 root signature string gets by default.
+fn root_signature(device: &ID3D12Device, batched: bool) -> windows::core::Result<ID3D12RootSignature> {
+    let view = |kind: D3D12_ROOT_PARAMETER_TYPE, register: u32| D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Flags: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE
+                } else {
+                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE
+                },
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let (srv, uav) = (D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV);
+    let params: Vec<D3D12_ROOT_PARAMETER1> = if batched {
+        (0..5).map(|t| view(srv, t)).chain([view(uav, 0), view(uav, 1)]).collect()
+    } else {
+        let constants = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 6 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        vec![constants, view(srv, 0), view(srv, 1), view(uav, 0), view(uav, 1)]
+    };
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: `desc` points at the live `params`; the blobs are read in full
+    // before they are released.
+    unsafe {
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(error.GetBufferPointer().cast::<u8>(), error.GetBufferSize());
+                tracing::warn!("argument clamp root signature: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
     }
 }
 

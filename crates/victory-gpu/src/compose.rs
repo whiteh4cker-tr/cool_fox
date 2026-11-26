@@ -10,20 +10,19 @@ use windows::core::{PCSTR, s};
 
 use crate::host::Host;
 
+// The root signature is made by `root_signature`, not taken from the shader:
+// under Wine `D3DCompile` is vkd3d-shader's, which embeds no `[RootSignature]`.
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -44,10 +43,11 @@ unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
-    // ours.
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the source and names live through the call; the out pointers
+    // are ours, and the error blob is read in full before it is released.
     unsafe {
-        D3DCompile(
+        let compiled = D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("compose"),
@@ -58,10 +58,81 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut errors),
+        );
+        if let Err(e) = compiled {
+            if let Some(errors) = errors {
+                let text = std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize());
+                tracing::warn!("two-plane composer: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
     }
     code.ok_or_else(windows::core::Error::empty)
+}
+
+/// The composer's root signature: the two planes as a table of two SRVs at
+/// t0 for the pixel shader, and a linear, clamping sampler at s0 (what the
+/// root signature string it replaces gave, with that string's defaults).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let range = D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let param = D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 16,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        MinLOD: 0.0,
+        MaxLOD: D3D12_FLOAT32_MAX,
+        ShaderRegister: 0,
+        RegisterSpace: 0,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: 1,
+                pParameters: &param,
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: `desc` points at the live `param`, `range` and `sampler`; the
+    // blobs are read in full before they are released.
+    unsafe {
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(error.GetBufferPointer().cast::<u8>(), error.GetBufferSize());
+                tracing::warn!("two-plane composer root signature: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
 }
 
 impl Composer {
@@ -70,13 +141,10 @@ impl Composer {
             compile(s!("vs"), s!("vs_5_1"))?,
             compile(s!("ps"), s!("ps_5_1"))?,
         );
-        // SAFETY: the blobs' own bytes, alive through the calls.
+        // SAFETY: the blobs, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let root = root_signature(device)?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

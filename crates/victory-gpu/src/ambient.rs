@@ -166,7 +166,9 @@ void keep(uint3 at : SV_DispatchThreadID) {
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        // NaN or infinity: every exponent bit set (no `isnan`/`isinf`, which
+        // Wine's compiler lacks).
+        c = any((asuint(c) & 0x7f800000u) == 0x7f800000u) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -359,7 +361,19 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                // As the shader's `RS`, made here: Wine's compiler embeds none.
+                use crate::rootsig::Param;
+                root = Some(crate::rootsig::make(
+                    device,
+                    &[
+                        Param::Constants { register: 0, count: 12 },
+                        Param::SrvTable { register: 0, count: 1, visibility: D3D12_SHADER_VISIBILITY_ALL },
+                        Param::UavTable { register: 0, count: 1 },
+                        Param::Uav(1),
+                        Param::Uav(2),
+                    ],
+                    "indirect light stand-in",
+                )?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),

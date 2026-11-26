@@ -62,6 +62,7 @@ pub mod queue;
 pub mod replay;
 #[cfg(windows)]
 mod residency;
+mod rootsig;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

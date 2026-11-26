@@ -30,7 +30,6 @@ pub(crate) const SOURCES: usize = 4;
 pub(crate) const TIMES: u32 = 31;
 
 pub(crate) const SOURCE: &str = r#"
-#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
 ByteAddressBuffer src0 : register(t0);
 ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
@@ -39,8 +38,10 @@ ByteAddressBuffer src3 : register(t3);
 // (4-7), words (8-11) and the executions that read it (16-31); the
 // record's offset in the source; its place in the scratch buffer; nothing.
 ByteAddressBuffer jobs : register(t4);
-RWByteAddressBuffer dst_args : register(u0);
-RWByteAddressBuffer budget : register(u1);
+// Written as words: Wine's compiler stores to structured buffers only.
+RWStructuredBuffer<uint> dst_args : register(u0);
+// In words: 0 the budget, 1-4 diagnostics.
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
@@ -53,7 +54,6 @@ uint load(uint source, uint at) {
     if (source == 2) return src2.Load(at);
     return src3.Load(at);
 }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint count = jobs.Load(0);
@@ -117,8 +117,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint n = count > first ? min(64u, count - first) : 0u;
     if (gi == 0 && n > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // No `[allow_uav_condition]`: Wine's compiler stops at it.
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -129,7 +129,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -151,17 +151,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && n > 0 && all_asked > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -174,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     for (uint s = 0; s < words; s++) {
-        dst_args.Store(job.z + s * 4, record[s]);
+        dst_args[job.z / 4 + s] = record[s];
     }
 }
 "#;
